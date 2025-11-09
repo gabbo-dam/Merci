@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: merci
+    ports: ["5432:5432"]
+  # Example NIM text generation (adjust to your NIM image/tag or use provided hosted URL)
+  nim:
+    image: nvcr.io/nim/meta/ai-endpoint:latest # replace with the Nemotron NIM image for the event
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+    ports: ["8000:8000"]
