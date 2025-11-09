@@ -31,10 +31,6 @@ MIN_CONF_AUTO = float(os.getenv("MIN_CONF_AUTO", "0.70"))
 MIN_CONF_SUGGEST = float(os.getenv("MIN_CONF_SUGGEST", "0.50"))
 REQUIRE_SIGNAL_FOR_CREATE = os.getenv("REQUIRE_SIGNAL_FOR_CREATE", "true").lower() == "true"
 
-# Allow simulate to create in the "suggest" band when there's explicit confirmation
-# or when this global toggle is enabled.
-ALLOW_CREATE_ON_SUGGEST = os.getenv("ALLOW_CREATE_ON_SUGGEST", "false").lower() == "true"
-
 ACTION_REGEX = re.compile(r"\b(please|can you|could you|we need to|let's|todo|fix|update|add|remove)\b", re.I)
 BUG_REGEX = re.compile(r"\b(bug|fix|broken|prod|outage|incident)\b", re.I)
 PRIORITY_REGEX = re.compile(r"\b(prod|outage|urgent|sev|p0)\b", re.I)
@@ -159,132 +155,10 @@ async def ai_analyze(text: str, mentioned: bool=False) -> Dict[str, Any]:
     fallback["source"] = f"fallback:{type(last_err).__name__}"
     return fallback
 
-# ---------- Jira metadata helpers (issuetype/priority resolution) ----------
-# Simple in-process caches
-_JIRA_ISSUETYPES_CACHE = {"ts": 0.0, "by_name": {}, "by_id": {}, "order": []}
-_JIRA_PRIORITIES_CACHE = {"ts": 0.0, "by_name": {}, "by_id": {}, "order": []}
-_JIRA_META_TTL = 300.0  # seconds
-
-def _normalize(s: str) -> str:
-    return (s or "").strip().lower()
-
-# Synonym groups that the AI might output vs. what the project actually has
-_ISSUE_TYPE_SYNONYMS = {
-    "bug":   ["bug", "defect", "incident", "problem"],
-    "task":  ["task", "chore"],
-    "story": ["story", "user story"],
-    "spike": ["spike", "investigation", "research"],
-}
-
-async def _jira_fetch_createmeta():
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{JIRA_BASE}/rest/api/3/issue/createmeta",
-            params={"projectKeys": JIRA_PROJECT},
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            headers={"Accept": "application/json"},
-        )
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, f"Jira createmeta error: {r.text}")
-
-    data = r.json()
-    projects = data.get("projects") or []
-    if not projects:
-        raise HTTPException(400, f"No createmeta for project {JIRA_PROJECT}: {r.text}")
-
-    issuetypes = projects[0].get("issuetypes") or []
-    by_name, by_id, order = {}, {}, []
-    for it in issuetypes:
-        name = (it.get("name") or "").strip()
-        it_id = it.get("id")
-        if name and it_id:
-            key = name.lower()
-            by_name[key] = {"id": it_id, "name": name}
-            by_id[it_id] = {"id": it_id, "name": name}
-            order.append({"id": it_id, "name": name})
-    return {"by_name": by_name, "by_id": by_id, "order": order}
-
-async def _jira_fetch_priorities():
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{JIRA_BASE}/rest/api/3/priority",
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            headers={"Accept": "application/json"},
-        )
-    if r.status_code >= 400:
-        # Non-fatal: just skip setting priority if we can't fetch
-        return {"by_name": {}, "by_id": {}, "order": []}
-
-    by_name, by_id, order = {}, {}, []
-    for p in r.json() or []:
-        name = (p.get("name") or "").strip()
-        p_id = p.get("id")
-        if name and p_id:
-            key = name.lower()
-            by_name[key] = {"id": p_id, "name": name}
-            by_id[p_id] = {"id": p_id, "name": name}
-            order.append({"id": p_id, "name": name})
-    return {"by_name": by_name, "by_id": by_id, "order": order}
-
-async def _jira_get_createmeta_cached():
-    now = time.time()
-    if now - _JIRA_ISSUETYPES_CACHE["ts"] > _JIRA_META_TTL:
-        meta = await _jira_fetch_createmeta()
-        _JIRA_ISSUETYPES_CACHE.update(meta)
-        _JIRA_ISSUETYPES_CACHE["ts"] = now
-    return _JIRA_ISSUETYPES_CACHE
-
-async def _jira_get_priorities_cached():
-    now = time.time()
-    if now - _JIRA_PRIORITIES_CACHE["ts"] > _JIRA_META_TTL:
-        meta = await _jira_fetch_priorities()
-        _JIRA_PRIORITIES_CACHE.update(meta)
-        _JIRA_PRIORITIES_CACHE["ts"] = now
-    return _JIRA_PRIORITIES_CACHE
-
-async def _resolve_issue_type_id(requested_issue_type: str) -> Dict[str, str]:
-    """
-    Returns {"id": "<issuetype_id>", "name": "<resolved_name>"} valid for the project.
-    Prefers direct match, then synonyms, then first allowed type as fallback.
-    """
-    meta = await _jira_get_createmeta_cached()
-    by_name = meta["by_name"]
-    order = meta["order"]
-    if not order:
-        raise HTTPException(400, "Project has no creatable issue types.")
-
-    key = _normalize(requested_issue_type)
-    if key in by_name:
-        return by_name[key]
-
-    # Try mapped synonyms (restricted to available types)
-    for canonical, synonyms in _ISSUE_TYPE_SYNONYMS.items():
-        if key in [_normalize(x) for x in synonyms]:
-            for candidate in synonyms:
-                ck = _normalize(candidate)
-                if ck in by_name:
-                    return by_name[ck]
-
-    # Fallback: first allowed type
-    return order[0]
-
-async def _resolve_priority_id(requested_priority: Optional[str]) -> Optional[Dict[str, str]]:
-    if not requested_priority:
-        return None
-    meta = await _jira_get_priorities_cached()
-    by_name = meta["by_name"]
-    key = _normalize(requested_priority)
-    return by_name.get(key)
-
 # ---------- Jira + Slack ----------
 async def jira_create(summary: str, description: str, issue_type: str = "Task",
                       labels: Optional[list]=None, priority: Optional[str]=None) -> str:
     if labels is None: labels = ["merci","autocaptured"]
-
-    # Resolve issue type and priority to IDs usable in this project
-    resolved_issuetype = await _resolve_issue_type_id(issue_type)
-    resolved_priority = await _resolve_priority_id(priority)
-
     fields = {
         "project": {"key": JIRA_PROJECT},
         "summary": summary,
@@ -295,13 +169,11 @@ async def jira_create(summary: str, description: str, issue_type: str = "Task",
                 {"type": "paragraph", "content": [{"type": "text", "text": description}]}
             ],
         },
-        # Use ID to avoid "Specify a valid issue type" project-specific errors
-        "issuetype": {"id": resolved_issuetype["id"]},
+        "issuetype": {"name": issue_type},
         "labels": labels,
     }
-    if resolved_priority:
-        fields["priority"] = {"id": resolved_priority["id"]}
-
+    if priority:
+        fields["priority"] = {"name": priority}
     payload = {"fields": fields}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
@@ -311,12 +183,7 @@ async def jira_create(summary: str, description: str, issue_type: str = "Task",
             headers={"Accept": "application/json", "Content-Type": "application/json"},
         )
     if r.status_code >= 400:
-        # Enrich with allowed types for easier debugging
-        try:
-            allowed = [i["name"] for i in (await _jira_get_createmeta_cached())["order"]]
-        except Exception:
-            allowed = []
-        raise HTTPException(r.status_code, f"Jira error: {r.text}\nAllowed issue types for {JIRA_PROJECT}: {allowed}")
+        raise HTTPException(r.status_code, f"Jira error: {r.text}")
     return r.json()["key"]
 
 async def slack_post(channel: str, thread_ts: str, text: str):
@@ -350,30 +217,22 @@ async def try_form():
     return """
     <html><head><title>Merci Demo</title></head>
       <body style="font-family:system-ui;max-width:720px;margin:40px auto">
-        <h1>Merci — Create a Jira Ticket</h1>
+        <h1>Merci — From conversation to completion</h1>
         <p>Paste a natural request (e.g., <i>please update onboarding docs before Monday</i>)</p>
         <form method="POST" action="/simulate">
           <textarea name="text" rows="6" style="width:100%;"></textarea><br/>
-          <label style="display:inline-block;margin-top:8px">
-            <input type="checkbox" name="confirm" value="1" />
-            Create if suggested (use confirmation context)
-          </label><br/>
           <button type="submit" style="margin-top:10px;padding:8px 14px">Analyze</button>
         </form>
       </body>
     </html>
     """
-
 def formatted_json_response(payload: Dict[str, Any], status_code: int = 200):
     # Pretty-print JSON with 2-space indentation
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     return PlainTextResponse(text, status_code=status_code, media_type="application/json")
 
 @app.post("/simulate")
-async def simulate(
-    text: str = Form(...),
-    confirm: Optional[str] = Form(None)  # "1" if checkbox ticked or client passes it
-):
+async def simulate(text: str = Form(...)):
     a = await ai_analyze(text)
 
     if is_smalltalk(text):
@@ -384,18 +243,13 @@ async def simulate(
         payload = {"created": None, "reason": "no_action_signals", "analysis": a}
         return formatted_json_response(payload)
 
-    # Determine creation mode
-    should_create_auto = a["confidence"] >= MIN_CONF_AUTO
-    has_confirmation_context = (confirm is not None) or ALLOW_CREATE_ON_SUGGEST
-    should_create_with_confirm = has_confirmation_context and (a["confidence"] >= MIN_CONF_SUGGEST)
-
-    if should_create_auto or should_create_with_confirm:
+    if a["confidence"] >= MIN_CONF_AUTO:
         key = await jira_create(
             a["title"], a["description"], a["issue_type"],
             labels=a.get("labels"), priority=a.get("priority")
         )
         jira_url = f"{JIRA_BASE}/browse/{key}"
-        payload = {"created": key, "url": jira_url, "analysis": a, "created_by": ("auto" if should_create_auto else "confirm")}
+        payload = {"created": key, "url": jira_url, "analysis": a}
         return formatted_json_response(payload)
 
     if a["confidence"] >= MIN_CONF_SUGGEST:
